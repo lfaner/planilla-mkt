@@ -7,17 +7,20 @@ El objetivo operativo es dejarlo listo para correr en un VPS en forma automátic
 ## Estado actual del script
 
 El archivo principal es [prueba-produc.py](<c:/Users/Usuario/OneDrive - Capital Gain Bursatil/Proyectos/Planilla_mkt/prueba-produc.py>).
+La lógica principal quedó separada en [planilla_mkt_app.py](<c:/Users/Usuario/OneDrive - Capital Gain Bursatil/Proyectos/Planilla_mkt/planilla_mkt_app.py>).
 
 Flujo real:
 
 1. Lee configuración desde variables de entorno.
-2. Abre la planilla de Google Sheets.
-3. Toma tickers desde la hoja 2.
-4. Construye `DataFrame`s base para instrumentos y cauciones.
-5. Se autentica en HomeBroker.
-6. Se suscribe a cotizaciones online.
-7. Entra en un `while True`.
-8. Cada 10 segundos, si hubo cambios, actualiza Google Sheets.
+2. Configura logging con rotación.
+3. Abre la planilla de Google Sheets.
+4. Toma tickers desde la hoja 2.
+5. Construye `DataFrame`s base para instrumentos y cauciones.
+6. Se autentica en HomeBroker.
+7. Se suscribe a cotizaciones online.
+8. Actualiza Google Sheets solo cuando cambian los datos.
+9. Si la conexión o los datos quedan stale, intenta reconectar automáticamente.
+10. Escribe un `healthcheck.json` con estado y métricas básicas.
 
 ## Cómo resolvimos la ruta del JSON
 
@@ -45,6 +48,14 @@ Variables soportadas:
 - `HB_PASSWORD`: contraseña de HomeBroker.
 - `LOG_LEVEL`: nivel de logging.
 - `APP_TIMEZONE`: zona horaria para validar día hábil.
+- `LOG_FILE`: archivo principal de logs rotativos.
+- `LOG_MAX_BYTES`: tamaño máximo por archivo de log.
+- `LOG_BACKUP_COUNT`: cantidad de archivos rotados.
+- `HEALTHCHECK_PATH`: archivo JSON con estado del proceso.
+- `UPDATE_INTERVAL_SECONDS`: frecuencia del loop de escritura.
+- `RECONNECT_DELAY_SECONDS`: espera inicial antes de reconectar.
+- `MAX_RECONNECT_DELAY_SECONDS`: tope para backoff de reconexión.
+- `STALE_MARKET_DATA_SECONDS`: segundos máximos sin datos antes de forzar reconexión.
 
 Ejemplo:
 
@@ -57,6 +68,14 @@ HB_USER=tu_usuario
 HB_PASSWORD=tu_password
 LOG_LEVEL=INFO
 APP_TIMEZONE=America/Argentina/Buenos_Aires
+LOG_FILE=/opt/planilla_mkt/planilla-mkt.log
+LOG_MAX_BYTES=5242880
+LOG_BACKUP_COUNT=5
+HEALTHCHECK_PATH=/opt/planilla_mkt/healthcheck.json
+UPDATE_INTERVAL_SECONDS=10
+RECONNECT_DELAY_SECONDS=15
+MAX_RECONNECT_DELAY_SECONDS=300
+STALE_MARKET_DATA_SECONDS=180
 ```
 
 ## Dependencias
@@ -78,10 +97,13 @@ pip install -r requirements.txt
 /opt/planilla_mkt/
 ├── .env
 ├── business_day_gate.py
+├── healthcheck.json
 ├── planilla-mkt-start.service
 ├── planilla-mkt-start.timer
 ├── planilla-mkt-stop.service
 ├── planilla-mkt-stop.timer
+├── planilla-mkt.log
+├── planilla_mkt_app.py
 ├── prueba-produc.py
 ├── requirements.txt
 └── credenciales_nuevo.json
@@ -98,6 +120,7 @@ Copiar al menos:
 - `credenciales_nuevo.json`
 - `.env`
 - `business_day_gate.py`
+- `planilla_mkt_app.py`
 - `planilla-mkt.service`
 - `planilla-mkt-start.service`
 - `planilla-mkt-stop.service`
@@ -115,24 +138,15 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3. Cargar variables de entorno
-
-```bash
-set -a
-source /opt/planilla_mkt/.env
-set +a
-```
-
-### 4. Probar ejecución
+### 3. Probar ejecución
 
 ```bash
 cd /opt/planilla_mkt
 source .venv/bin/activate
-set -a
-source .env
-set +a
 python prueba-produc.py
 ```
+
+El script carga automáticamente `.env` si existe en el mismo directorio.
 
 Si está bien configurado:
 
@@ -140,6 +154,28 @@ Si está bien configurado:
 2. Abre la planilla.
 3. Empieza a actualizar Google Sheets.
 4. Queda corriendo hasta que lo detengas.
+
+## Mejoras de resiliencia
+
+El runtime ahora incorpora:
+
+1. Reintentos y reconexión automática a HomeBroker con backoff.
+2. Manejo de `SIGINT` y `SIGTERM` para apagado ordenado.
+3. Logging rotativo con `RotatingFileHandler`.
+4. Health check basado en archivo JSON.
+5. Métricas básicas:
+   - `status`
+   - `last_market_update_at`
+   - `last_sheet_update_at`
+   - `last_successful_connect_at`
+   - `reconnect_count`
+   - `google_write_count`
+
+Podés inspeccionar el health check así:
+
+```bash
+cat /opt/planilla_mkt/healthcheck.json
+```
 
 ## Automatización recomendada
 
@@ -168,11 +204,15 @@ Type=simple
 User=planilla
 WorkingDirectory=/opt/planilla_mkt
 EnvironmentFile=/opt/planilla_mkt/.env
+Environment=PYTHONUNBUFFERED=1
+ExecCondition=/opt/planilla_mkt/.venv/bin/python /opt/planilla_mkt/business_day_gate.py
 ExecStart=/opt/planilla_mkt/.venv/bin/python /opt/planilla_mkt/prueba-produc.py
 Restart=always
 RestartSec=15
-StandardOutput=append:/var/log/planilla-mkt.log
-StandardError=append:/var/log/planilla-mkt.error.log
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -181,7 +221,8 @@ WantedBy=multi-user.target
 Notas:
 
 - Ajustá `User=planilla` al usuario real del VPS.
-- Si tu sistema no soporta `append:` en `StandardOutput`, usá `journalctl`.
+- `ExecCondition` evita que el servicio arranque en fines de semana o feriados incluso si alguien ejecuta `systemctl start planilla-mkt`.
+- Los logs persistentes del proceso quedan en `LOG_FILE` y la salida estándar queda en `journalctl`.
 
 ### Comandos de control
 
@@ -258,18 +299,12 @@ Se aplicaron estos cambios:
 1. La ruta del JSON pasó a ser configurable.
 2. Las credenciales de HomeBroker salieron del código.
 3. El nombre de la planilla pasó a ser configurable.
-4. Se agregó logging básico.
-5. Se agregó `requirements.txt`.
-6. Se agregó `.env.example`.
-7. Se agregaron servicios y timers `systemd` para arranque y stop automáticos.
-8. Se agregó validación de día hábil usando `cgb_utils.feriados`.
-
-## Qué falta para una versión todavía más robusta
-
-Esto ya deja el script en un estado razonable para producción simple. Lo siguiente sería la segunda etapa:
-
-1. Reintentos y reconexión automática a HomeBroker.
-2. Manejo de apagado ordenado con señales.
-3. Separar el script en funciones o módulos.
-4. Métricas o health check.
-5. Rotación de logs.
+4. La lógica de negocio se separó en `planilla_mkt_app.py`.
+5. Se agregó logging rotativo.
+6. Se agregó reconexión automática.
+7. Se agregó apagado ordenado por señales.
+8. Se agregó `healthcheck.json` con métricas básicas.
+9. Se agregó `requirements.txt`.
+10. Se agregó `.env.example`.
+11. Se agregaron servicios y timers `systemd` para arranque y stop automáticos.
+12. Se agregó validación de día hábil usando `cgb_utils.feriados`.

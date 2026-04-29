@@ -8,11 +8,15 @@ Type=simple
 User=planilla
 WorkingDirectory=/opt/planilla_mkt
 EnvironmentFile=/opt/planilla_mkt/.env
+Environment=PYTHONUNBUFFERED=1
+ExecCondition=/opt/planilla_mkt/.venv/bin/python /opt/planilla_mkt/business_day_gate.py
 ExecStart=/opt/planilla_mkt/.venv/bin/python /opt/planilla_mkt/prueba-produc.py
 Restart=always
 RestartSec=15
-StandardOutput=append:/var/log/planilla-mkt.log
-StandardError=append:/var/log/planilla-mkt.error.log
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
