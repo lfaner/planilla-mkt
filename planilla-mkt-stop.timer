@@ -1,0 +1,10 @@
+[Unit]
+Description=Timer de detencion para Planilla MKT a las 17:00 Argentina en dias habiles
+
+[Timer]
+OnCalendar=Mon..Fri 17:00:00
+Persistent=true
+Unit=planilla-mkt-stop.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Timer de arranque para Planilla MKT a las 10:30 Argentina en dias habiles
+
+[Timer]
+OnCalendar=Mon..Fri 10:30:00
+Persistent=true
+Unit=planilla-mkt-start.service
+
+[Install]
+WantedBy=timers.target

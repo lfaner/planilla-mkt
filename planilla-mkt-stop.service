@@ -1,0 +1,9 @@
+[Unit]
+Description=Detencion programada de Planilla MKT en dia habil
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/planilla_mkt
+EnvironmentFile=/opt/planilla_mkt/.env
+ExecCondition=/opt/planilla_mkt/.venv/bin/python /opt/planilla_mkt/business_day_gate.py
+ExecStart=/usr/bin/systemctl stop planilla-mkt.service

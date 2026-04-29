@@ -1,0 +1,11 @@
+[Unit]
+Description=Arranque programado de Planilla MKT en dia habil
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/planilla_mkt
+EnvironmentFile=/opt/planilla_mkt/.env
+ExecCondition=/opt/planilla_mkt/.venv/bin/python /opt/planilla_mkt/business_day_gate.py
+ExecStart=/usr/bin/systemctl start planilla-mkt.service
