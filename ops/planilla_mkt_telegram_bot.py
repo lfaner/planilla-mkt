@@ -6,13 +6,16 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, time as datetime_time, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 DEFAULT_BOT_TIMEOUT_SECONDS = "30"
 DEFAULT_HEALTHCHECK_PATH = "/opt/planilla_mkt/healthcheck.json"
 DEFAULT_SERVICE_NAME = "planilla-mkt.service"
+DEFAULT_OPERATING_START = "10:30"
+DEFAULT_OPERATING_END = "17:00"
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
 
@@ -56,6 +59,72 @@ def run_systemctl(*args: str) -> tuple[int, str]:
     return result.returncode, output
 
 
+def parse_hhmm(value: str) -> datetime_time:
+    hour, minute = value.split(":", 1)
+    return datetime_time(hour=int(hour), minute=int(minute))
+
+
+def is_business_day(now: datetime) -> tuple[bool, str]:
+    if now.weekday() >= 5:
+        return False, f"{now.date().isoformat()} es fin de semana"
+
+    try:
+        from cgb_utils.feriados import es_feriado
+    except ImportError as exc:
+        return False, f"no se pudo evaluar feriados: {exc}"
+
+    if es_feriado(now.date()):
+        return False, f"{now.date().isoformat()} es feriado"
+
+    return True, f"{now.date().isoformat()} es dia habil"
+
+
+def is_operating_time(now: datetime) -> tuple[bool, str]:
+    start = parse_hhmm(get_env("WATCHDOG_OPERATING_START", DEFAULT_OPERATING_START))
+    end = parse_hhmm(get_env("WATCHDOG_OPERATING_END", DEFAULT_OPERATING_END))
+    current = now.time().replace(second=0, microsecond=0)
+
+    if start <= current < end:
+        return True, f"dentro de horario operativo {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
+    return False, f"fuera de horario operativo {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
+
+
+def can_start_or_restart() -> tuple[bool, str]:
+    timezone_name = get_env("APP_TIMEZONE", "America/Argentina/Buenos_Aires")
+    now = datetime.now(ZoneInfo(timezone_name))
+    business_day, business_reason = is_business_day(now)
+    operating_time, operating_reason = is_operating_time(now)
+
+    if not business_day or not operating_time:
+        return False, f"{business_reason}; {operating_reason}"
+
+    return True, f"{business_reason}; {operating_reason}"
+
+
+def summarize_timer(unit_name: str) -> str:
+    code, output = run_systemctl(
+        "show",
+        unit_name,
+        "--property=ActiveState",
+        "--property=NextElapseUSecRealtime",
+        "--property=LastTriggerUSec",
+    )
+    if code != 0:
+        return f"{unit_name}: error: {output or code}"
+
+    values = {}
+    for line in output.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value or "n/a"
+
+    return (
+        f"{unit_name}: {values.get('ActiveState', 'n/a')}\n"
+        f"next: {values.get('NextElapseUSecRealtime', 'n/a')}\n"
+        f"last: {values.get('LastTriggerUSec', 'n/a')}"
+    )
+
+
 def read_healthcheck(path: Path) -> dict:
     if not path.exists():
         return {"status": "missing", "detail": f"Healthcheck not found: {path}"}
@@ -81,6 +150,8 @@ def summarize_health(payload: dict) -> str:
 def summarize_status(service_name: str) -> str:
     code_active, active = run_systemctl("is-active", service_name)
     code_enabled, enabled = run_systemctl("is-enabled", service_name)
+    _code_watchdog, watchdog = run_systemctl("is-active", "planilla-mkt-watchdog.timer")
+    _can_control, schedule_reason = can_start_or_restart()
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     return "\n".join(
         [
@@ -88,6 +159,12 @@ def summarize_status(service_name: str) -> str:
             f"utc_now: {now}",
             f"is_active: {active or code_active}",
             f"is_enabled: {enabled or code_enabled}",
+            f"watchdog_timer: {watchdog or 'unknown'}",
+            f"schedule: {schedule_reason}",
+            "",
+            summarize_timer("planilla-mkt-start.timer"),
+            "",
+            summarize_timer("planilla-mkt-stop.timer"),
         ]
     )
 
@@ -99,6 +176,18 @@ def normalize_command(text: str) -> str:
     return command
 
 
+def control_service(action: str, service_name: str, enforce_schedule: bool = True) -> str:
+    if action in {"start", "restart"} and enforce_schedule:
+        allowed, reason = can_start_or_restart()
+        if not allowed:
+            return f"{action} bloqueado\n{reason}"
+
+    code, output = run_systemctl(action, service_name)
+    if code == 0:
+        return f"{action} ok\n{summarize_status(service_name)}"
+    return f"{action} failed\n{output or 'no output'}"
+
+
 def handle_command(token: str, chat_id: int, text: str, service_name: str, healthcheck_path: Path) -> None:
     command = normalize_command(text)
 
@@ -106,7 +195,7 @@ def handle_command(token: str, chat_id: int, text: str, service_name: str, healt
         send_message(
             token,
             chat_id,
-            "Comandos disponibles:\n/status\n/health\n/restart",
+            "Comandos disponibles:\n/status\n/health\n/start_service\n/stop\n/restart",
         )
         return
 
@@ -119,15 +208,23 @@ def handle_command(token: str, chat_id: int, text: str, service_name: str, healt
         send_message(token, chat_id, summarize_health(payload))
         return
 
-    if command == "/restart":
-        code, output = run_systemctl("restart", service_name)
-        if code == 0:
-            send_message(token, chat_id, f"restart ok\n{summarize_status(service_name)}")
-        else:
-            send_message(token, chat_id, f"restart failed\n{output or 'no output'}")
+    if command == "/start_service":
+        send_message(token, chat_id, control_service("start", service_name))
         return
 
-    send_message(token, chat_id, "Comando no reconocido. Usá /status, /health o /restart")
+    if command == "/stop":
+        send_message(token, chat_id, control_service("stop", service_name, enforce_schedule=False))
+        return
+
+    if command == "/restart":
+        send_message(token, chat_id, control_service("restart", service_name))
+        return
+
+    send_message(
+        token,
+        chat_id,
+        "Comando no reconocido. Usa /status, /health, /start_service, /stop o /restart",
+    )
 
 
 def main() -> int:

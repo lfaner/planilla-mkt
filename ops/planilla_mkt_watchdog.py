@@ -3,14 +3,17 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 DEFAULT_HEALTHCHECK_PATH = "/opt/planilla_mkt/healthcheck.json"
 DEFAULT_SERVICE_NAME = "planilla-mkt.service"
 DEFAULT_MAX_HEALTHCHECK_AGE_SECONDS = "240"
 DEFAULT_ALLOWED_STATUSES = "running"
+DEFAULT_OPERATING_START = "10:30"
+DEFAULT_OPERATING_END = "17:00"
 
 
 def get_env(name: str, default: str | None = None) -> str:
@@ -55,6 +58,48 @@ def status_is_invalid(payload: dict, allowed_statuses: set[str]) -> tuple[bool, 
     return False, f"status ok: {status}"
 
 
+def parse_hhmm(value: str) -> time:
+    hour, minute = value.split(":", 1)
+    return time(hour=int(hour), minute=int(minute))
+
+
+def is_business_day(now: datetime) -> tuple[bool, str]:
+    if now.weekday() >= 5:
+        return False, f"{now.date().isoformat()} is weekend"
+
+    try:
+        from cgb_utils.feriados import es_feriado
+    except ImportError as exc:
+        return False, f"cannot evaluate holidays: {exc}"
+
+    if es_feriado(now.date()):
+        return False, f"{now.date().isoformat()} is holiday"
+
+    return True, f"{now.date().isoformat()} is business day"
+
+
+def is_operating_time(now: datetime, start: time, end: time) -> tuple[bool, str]:
+    current = now.time().replace(second=0, microsecond=0)
+    if start <= current < end:
+        return True, f"inside operating window {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
+    return False, f"outside operating window {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
+
+
+def should_watchdog_run() -> tuple[bool, str]:
+    timezone_name = get_env("APP_TIMEZONE", "America/Argentina/Buenos_Aires")
+    start = parse_hhmm(get_env("WATCHDOG_OPERATING_START", DEFAULT_OPERATING_START))
+    end = parse_hhmm(get_env("WATCHDOG_OPERATING_END", DEFAULT_OPERATING_END))
+    now = datetime.now(ZoneInfo(timezone_name))
+
+    business_day, business_reason = is_business_day(now)
+    operating_time, operating_reason = is_operating_time(now, start, end)
+
+    if not business_day or not operating_time:
+        return False, f"{business_reason}; {operating_reason}"
+
+    return True, f"{business_reason}; {operating_reason}"
+
+
 def restart_service(service_name: str, reason: str) -> int:
     print(f"[watchdog] restarting {service_name}: {reason}")
     result = subprocess.run(
@@ -84,6 +129,11 @@ def main() -> int:
         for item in get_env("WATCHDOG_ALLOWED_STATUSES", DEFAULT_ALLOWED_STATUSES).split(",")
         if item.strip()
     }
+
+    should_run, schedule_reason = should_watchdog_run()
+    if not should_run:
+        print(f"[watchdog] skipped: {schedule_reason}")
+        return 0
 
     try:
         payload = load_healthcheck(healthcheck_path)

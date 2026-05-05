@@ -56,6 +56,14 @@ Variables soportadas:
 - `RECONNECT_DELAY_SECONDS`: espera inicial antes de reconectar.
 - `MAX_RECONNECT_DELAY_SECONDS`: tope para backoff de reconexión.
 - `STALE_MARKET_DATA_SECONDS`: segundos máximos sin datos antes de forzar reconexión.
+- `PLANILLA_SERVICE_NAME`: nombre del servicio `systemd` que controla watchdog/bot.
+- `WATCHDOG_MAX_HEALTHCHECK_AGE_SECONDS`: antigüedad máxima aceptada del healthcheck.
+- `WATCHDOG_ALLOWED_STATUSES`: estados del healthcheck que el watchdog considera sanos.
+- `WATCHDOG_OPERATING_START`: inicio de la ventana operativa para watchdog/bot.
+- `WATCHDOG_OPERATING_END`: fin de la ventana operativa para watchdog/bot.
+- `TELEGRAM_BOT_TOKEN`: token del bot de Telegram.
+- `TELEGRAM_ALLOWED_CHAT_IDS`: chats privados o grupos autorizados, separados por coma.
+- `TELEGRAM_BOT_TIMEOUT_SECONDS`: timeout del long polling de Telegram.
 
 Ejemplo:
 
@@ -76,6 +84,14 @@ UPDATE_INTERVAL_SECONDS=10
 RECONNECT_DELAY_SECONDS=15
 MAX_RECONNECT_DELAY_SECONDS=300
 STALE_MARKET_DATA_SECONDS=180
+PLANILLA_SERVICE_NAME=planilla-mkt.service
+WATCHDOG_MAX_HEALTHCHECK_AGE_SECONDS=240
+WATCHDOG_ALLOWED_STATUSES=starting,running,reconnecting
+WATCHDOG_OPERATING_START=10:30
+WATCHDOG_OPERATING_END=17:00
+TELEGRAM_BOT_TOKEN=tu_token
+TELEGRAM_ALLOWED_CHAT_IDS=123456789,-1001234567890
+TELEGRAM_BOT_TIMEOUT_SECONDS=30
 ```
 
 ## Dependencias
@@ -98,6 +114,9 @@ pip install -r requirements.txt
 ├── .env
 ├── business_day_gate.py
 ├── healthcheck.json
+├── ops
+│   ├── planilla_mkt_telegram_bot.py
+│   └── planilla_mkt_watchdog.py
 ├── planilla-mkt-start.service
 ├── planilla-mkt-start.timer
 ├── planilla-mkt-stop.service
@@ -126,6 +145,8 @@ Copiar al menos:
 - `planilla-mkt-stop.service`
 - `planilla-mkt-start.timer`
 - `planilla-mkt-stop.timer`
+- `ops/planilla_mkt_watchdog.py`
+- `ops/planilla_mkt_telegram_bot.py`
 
 ### 2. Crear el entorno e instalar dependencias
 
@@ -277,6 +298,111 @@ sudo systemctl status planilla-mkt-start.timer
 sudo systemctl status planilla-mkt-stop.timer
 ```
 
+## Watchdog operativo
+
+El watchdog vive en `ops/planilla_mkt_watchdog.py` y se ejecuta con `planilla-mkt-watchdog.timer`.
+
+Su función es revisar `healthcheck.json` y reiniciar `planilla-mkt.service` si:
+
+1. El healthcheck está vencido.
+2. El estado del proceso no está en `WATCHDOG_ALLOWED_STATUSES`.
+3. La revisión ocurre en día hábil y dentro de la ventana `WATCHDOG_OPERATING_START` a `WATCHDOG_OPERATING_END`.
+
+Fuera de la ventana operativa, o en fines de semana/feriados, el watchdog termina OK y no levanta HomeBroker. Esto evita reconexiones fuera de mercado.
+
+Configuración recomendada:
+
+```env
+WATCHDOG_MAX_HEALTHCHECK_AGE_SECONDS=240
+WATCHDOG_ALLOWED_STATUSES=starting,running,reconnecting
+WATCHDOG_OPERATING_START=10:30
+WATCHDOG_OPERATING_END=17:00
+```
+
+Unidad instalada:
+
+```ini
+[Unit]
+Description=Planilla MKT watchdog
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/planilla_mkt/.env
+ExecStart=/opt/planilla_mkt/.venv/bin/python /opt/planilla_mkt/ops/planilla_mkt_watchdog.py
+```
+
+Timer recomendado:
+
+```ini
+[Unit]
+Description=Periodic watchdog for Planilla MKT
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+Unit=planilla-mkt-watchdog.service
+
+[Install]
+WantedBy=timers.target
+```
+
+Instalación:
+
+```bash
+# Crear /etc/systemd/system/planilla-mkt-watchdog.service con el contenido anterior.
+# Crear /etc/systemd/system/planilla-mkt-watchdog.timer con el contenido anterior.
+sudo systemctl daemon-reload
+sudo systemctl enable --now planilla-mkt-watchdog.timer
+```
+
+## Bot de Telegram
+
+El bot vive en `ops/planilla_mkt_telegram_bot.py` y permite controlar `planilla-mkt.service` desde chats autorizados.
+
+Comandos disponibles:
+
+- `/status`: muestra estado del servicio, watchdog, ventana operativa y próximos timers.
+- `/health`: muestra el contenido resumido de `healthcheck.json`.
+- `/start_service`: intenta iniciar `planilla-mkt.service`.
+- `/stop`: detiene `planilla-mkt.service`.
+- `/restart`: intenta reiniciar `planilla-mkt.service`.
+
+`/start_service` y `/restart` respetan la misma ventana operativa que el watchdog. Fuera de día hábil u horario de mercado, el bot bloquea la acción. `/stop` queda permitido en cualquier momento.
+
+Para habilitar chats privados o grupos:
+
+```env
+TELEGRAM_BOT_TOKEN=tu_token
+TELEGRAM_ALLOWED_CHAT_IDS=123456789,-1001234567890
+TELEGRAM_BOT_TIMEOUT_SECONDS=30
+```
+
+En grupos, Telegram puede enviar comandos con mención al bot, por ejemplo `/status@NombreDelBot`; el bot normaliza ese formato.
+
+Unidad instalada:
+
+```ini
+[Unit]
+Description=Planilla MKT Telegram control bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/planilla_mkt
+EnvironmentFile=/opt/planilla_mkt/.env
+ExecStart=/opt/planilla_mkt/.venv/bin/python /opt/planilla_mkt/ops/planilla_mkt_telegram_bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
 Dependencia importante:
 
 `business_day_gate.py` usa `cgb_utils.feriados`. Por eso `requirements.txt` ahora incluye:
@@ -308,3 +434,5 @@ Se aplicaron estos cambios:
 10. Se agregó `.env.example`.
 11. Se agregaron servicios y timers `systemd` para arranque y stop automáticos.
 12. Se agregó validación de día hábil usando `cgb_utils.feriados`.
+13. Se agregó watchdog operativo con ventana de mercado para evitar reconexiones fuera de horario.
+14. Se agregó bot de Telegram para consultar estado, healthcheck y controlar el servicio desde chats autorizados.
