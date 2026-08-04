@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -17,6 +18,12 @@ DEFAULT_SERVICE_NAME = "planilla-mkt.service"
 DEFAULT_OPERATING_START = "10:30"
 DEFAULT_OPERATING_END = "17:00"
 TELEGRAM_API_BASE = "https://api.telegram.org"
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 def get_env(name: str, default: str | None = None, required: bool = False) -> str:
@@ -38,6 +45,7 @@ def api_request(token: str, method: str, params: dict | None = None) -> dict:
 
 
 def send_message(token: str, chat_id: int, text: str) -> None:
+    logger.info("sending telegram message to chat_id=%s text=%r", chat_id, text[:200])
     api_request(
         token,
         "sendMessage",
@@ -49,6 +57,7 @@ def send_message(token: str, chat_id: int, text: str) -> None:
 
 
 def run_systemctl(*args: str) -> tuple[int, str]:
+    logger.info("running systemctl %s", " ".join(args))
     result = subprocess.run(
         ["/usr/bin/systemctl", *args],
         check=False,
@@ -56,6 +65,7 @@ def run_systemctl(*args: str) -> tuple[int, str]:
         text=True,
     )
     output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+    logger.info("systemctl %s -> code=%s output=%r", " ".join(args), result.returncode, output[:500])
     return result.returncode, output
 
 
@@ -190,6 +200,7 @@ def control_service(action: str, service_name: str, enforce_schedule: bool = Tru
 
 def handle_command(token: str, chat_id: int, text: str, service_name: str, healthcheck_path: Path) -> None:
     command = normalize_command(text)
+    logger.info("received telegram command chat_id=%s raw=%r normalized=%r", chat_id, text, command)
 
     if command == "/start":
         send_message(
@@ -252,14 +263,18 @@ def main() -> int:
             chat_id = chat.get("id")
             text = message.get("text", "")
 
+            logger.info("received telegram update_id=%s chat_id=%s text=%r", item.get("update_id"), chat_id, text)
+
             if chat_id not in allowed_chat_ids:
                 if chat_id is not None:
+                    logger.warning("unauthorized chat_id=%s", chat_id)
                     send_message(token, int(chat_id), "No autorizado.")
                 continue
 
             try:
                 handle_command(token, int(chat_id), text, service_name, healthcheck_path)
             except Exception as exc:
+                logger.exception("error handling command chat_id=%s text=%r", chat_id, text)
                 send_message(token, int(chat_id), f"error: {exc}")
 
         time.sleep(1)
