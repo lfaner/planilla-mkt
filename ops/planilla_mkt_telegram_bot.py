@@ -162,7 +162,7 @@ def summarize_status(service_name: str, watchdog_timer_name: str) -> str:
     code_active, active = run_systemctl("is-active", service_name)
     code_enabled, enabled = run_systemctl("is-enabled", service_name)
     _code_watchdog, watchdog = run_systemctl("is-active", watchdog_timer_name)
-    _can_control, schedule_reason = can_start_or_restart()
+    _can_control, schedule_reason = can_start()
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     return "\n".join(
         [
