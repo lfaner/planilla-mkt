@@ -100,7 +100,7 @@ def is_operating_time(now: datetime) -> tuple[bool, str]:
     return False, f"fuera de horario operativo {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
 
 
-def can_start_or_restart() -> tuple[bool, str]:
+def can_start() -> tuple[bool, str]:
     timezone_name = get_env("APP_TIMEZONE", "America/Argentina/Buenos_Aires")
     now = datetime.now(ZoneInfo(timezone_name))
     business_day, business_reason = is_business_day(now)
@@ -190,8 +190,8 @@ def normalize_command(text: str) -> str:
 def control_service(action: str, service_name: str, enforce_schedule: bool = True) -> str:
     watchdog_timer_name = get_env("WATCHDOG_TIMER_NAME", DEFAULT_WATCHDOG_TIMER_NAME)
 
-    if action in {"start", "restart"} and enforce_schedule:
-        allowed, reason = can_start_or_restart()
+    if action == "start" and enforce_schedule:
+        allowed, reason = can_start()
         if not allowed:
             return f"{action} bloqueado\n{reason}"
 
@@ -201,7 +201,7 @@ def control_service(action: str, service_name: str, enforce_schedule: bool = Tru
             return f"{action} failed\nno se pudo detener {watchdog_timer_name}: {watchdog_output or watchdog_code}"
 
     code, output = run_systemctl(action, service_name)
-    if code == 0 and action in {"start", "restart"}:
+    if code == 0 and action == "start":
         watchdog_code, watchdog_output = run_systemctl("start", watchdog_timer_name)
         if watchdog_code != 0:
             return f"{action} partial\n{service_name} ok pero no se pudo iniciar {watchdog_timer_name}: {watchdog_output or watchdog_code}"
@@ -216,11 +216,7 @@ def handle_command(token: str, chat_id: int, text: str, service_name: str, healt
     logger.info("received telegram command chat_id=%s raw=%r normalized=%r", chat_id, text, command)
 
     if command == "/start":
-        send_message(
-            token,
-            chat_id,
-            "Comandos disponibles:\n/status\n/health\n/start_service\n/stop\n/restart",
-        )
+        send_message(token, chat_id, control_service("start", service_name))
         return
 
     if command == "/status":
@@ -239,22 +235,14 @@ def handle_command(token: str, chat_id: int, text: str, service_name: str, healt
         send_message(token, chat_id, summarize_health(payload))
         return
 
-    if command == "/start_service":
-        send_message(token, chat_id, control_service("start", service_name))
-        return
-
     if command == "/stop":
         send_message(token, chat_id, control_service("stop", service_name, enforce_schedule=False))
-        return
-
-    if command == "/restart":
-        send_message(token, chat_id, control_service("restart", service_name))
         return
 
     send_message(
         token,
         chat_id,
-        "Comando no reconocido. Usa /status, /health, /start_service, /stop o /restart",
+        "Comando no reconocido. Usa /start, /status, /health o /stop",
     )
 
 

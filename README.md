@@ -371,11 +371,10 @@ Comandos disponibles:
 
 - `/status`: muestra estado del servicio, watchdog, ventana operativa y próximos timers.
 - `/health`: muestra el contenido resumido de `healthcheck.json`.
-- `/start_service`: intenta iniciar `planilla-mkt.service`.
+- `/start`: intenta iniciar `planilla-mkt.service`.
 - `/stop`: detiene `planilla-mkt.service`.
-- `/restart`: intenta reiniciar `planilla-mkt.service`.
 
-`/start_service` y `/restart` respetan la misma ventana operativa que el watchdog. Fuera de día hábil u horario de mercado, el bot bloquea la acción. `/stop` queda permitido en cualquier momento.
+`/start` respeta la misma ventana operativa que el watchdog. Fuera de día hábil u horario de mercado, el bot bloquea la acción. `/stop` queda permitido en cualquier momento.
 
 Para habilitar chats privados o grupos:
 
