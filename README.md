@@ -1,6 +1,6 @@
 # Planilla MKT
 
-Este proyecto actualiza una Google Sheet con cotizaciones de mercado obtenidas desde `pyhomebroker`.
+Este proyecto actualiza una Google Sheet con cotizaciones de mercado obtenidas desde `pyRofex`.
 
 El objetivo operativo es dejarlo listo para correr en un VPS en forma automática, a una hora determinada, con configuración externa al código y sin secretos hardcodeados.
 
@@ -15,12 +15,13 @@ Flujo real:
 2. Configura logging con rotación.
 3. Abre la planilla de Google Sheets.
 4. Toma tickers desde la hoja 2.
-5. Construye `DataFrame`s base para instrumentos y cauciones.
-6. Se autentica en HomeBroker.
-7. Se suscribe a cotizaciones online.
-8. Actualiza Google Sheets solo cuando cambian los datos.
-9. Si la conexión o los datos quedan stale, intenta reconectar automáticamente.
-10. Escribe un `healthcheck.json` con estado y métricas básicas.
+5. Construye el `DataFrame` base de instrumentos.
+6. Se autentica en pyRofex.
+7. Traduce los tickers de la planilla al formato de pyRofex y valida cuáles existen.
+8. Se suscribe a cotizaciones online por websocket.
+9. Actualiza Google Sheets solo cuando cambian los datos.
+10. Si la conexión o los datos quedan stale, intenta reconectar automáticamente.
+11. Escribe un `healthcheck.json` con estado y métricas básicas.
 
 ## Cómo resolvimos la ruta del JSON
 
@@ -42,10 +43,12 @@ Variables soportadas:
 
 - `GOOGLE_CREDENTIALS_PATH`: ruta al JSON de la service account de Google.
 - `GOOGLE_SHEET_NAME`: nombre de la planilla a abrir.
-- `HB_BROKER`: broker de HomeBroker.
-- `HB_DNI`: DNI del usuario.
-- `HB_USER`: usuario de HomeBroker.
-- `HB_PASSWORD`: contraseña de HomeBroker.
+- `PYROFEX_USER`: usuario de pyRofex.
+- `PYROFEX_PASSWORD`: contraseña de pyRofex.
+- `PYROFEX_ACCOUNT`: cuenta asociada a pyRofex.
+- `PYROFEX_API_URL`: endpoint HTTP de pyRofex.
+- `PYROFEX_WS_URL`: endpoint websocket de pyRofex.
+- `DEBUG_PRINT_RAW`: habilita logueo de los primeros mensajes crudos del websocket.
 - `LOG_LEVEL`: nivel de logging.
 - `APP_TIMEZONE`: zona horaria para validar día hábil.
 - `LOG_FILE`: archivo principal de logs rotativos.
@@ -70,10 +73,12 @@ Ejemplo:
 ```env
 GOOGLE_CREDENTIALS_PATH=/opt/planilla_mkt/credenciales_nuevo.json
 GOOGLE_SHEET_NAME=Planilla_CGB
-HB_BROKER=284
-HB_DNI=tu_dni
-HB_USER=tu_usuario
-HB_PASSWORD=tu_password
+PYROFEX_USER=tu_usuario
+PYROFEX_PASSWORD=tu_password
+PYROFEX_ACCOUNT=tu_cuenta
+PYROFEX_API_URL=https://api.eco.xoms.com.ar/
+PYROFEX_WS_URL=wss://api.eco.xoms.com.ar/
+DEBUG_PRINT_RAW=false
 LOG_LEVEL=INFO
 APP_TIMEZONE=America/Argentina/Buenos_Aires
 LOG_FILE=/opt/planilla_mkt/planilla-mkt.log
@@ -171,16 +176,17 @@ El script carga automáticamente `.env` si existe en el mismo directorio.
 
 Si está bien configurado:
 
-1. Se autentica en HomeBroker.
+1. Se autentica en pyRofex.
 2. Abre la planilla.
-3. Empieza a actualizar Google Sheets.
-4. Queda corriendo hasta que lo detengas.
+3. Valida tickers y se suscribe a datos de mercado.
+4. Empieza a actualizar Google Sheets.
+5. Queda corriendo hasta que lo detengas.
 
 ## Mejoras de resiliencia
 
 El runtime ahora incorpora:
 
-1. Reintentos y reconexión automática a HomeBroker con backoff.
+1. Reintentos y reconexión automática a pyRofex con backoff.
 2. Manejo de `SIGINT` y `SIGTERM` para apagado ordenado.
 3. Logging rotativo con `RotatingFileHandler`.
 4. Health check basado en archivo JSON.
@@ -308,7 +314,7 @@ Su función es revisar `healthcheck.json` y reiniciar `planilla-mkt.service` si:
 2. El estado del proceso no está en `WATCHDOG_ALLOWED_STATUSES`.
 3. La revisión ocurre en día hábil y dentro de la ventana `WATCHDOG_OPERATING_START` a `WATCHDOG_OPERATING_END`.
 
-Fuera de la ventana operativa, o en fines de semana/feriados, el watchdog termina OK y no levanta HomeBroker. Esto evita reconexiones fuera de mercado.
+Fuera de la ventana operativa, o en fines de semana/feriados, el watchdog termina OK y no levanta pyRofex. Esto evita reconexiones fuera de mercado.
 
 Configuración recomendada:
 
@@ -423,7 +429,7 @@ pip install -r /opt/planilla_mkt/requirements.txt
 Se aplicaron estos cambios:
 
 1. La ruta del JSON pasó a ser configurable.
-2. Las credenciales de HomeBroker salieron del código.
+2. Las credenciales de pyRofex salieron del código.
 3. El nombre de la planilla pasó a ser configurable.
 4. La lógica de negocio se separó en `planilla_mkt_app.py`.
 5. Se agregó logging rotativo.

@@ -1,5 +1,6 @@
 gspread
 gspread-dataframe
 pandas
-pyhomebroker
+pyRofex
+websocket-client>=0.54.0,<0.58.0
 cgb-utils @ git+https://github.com/lfaner/cgb-utils.git

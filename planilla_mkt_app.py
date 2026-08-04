@@ -1,19 +1,23 @@
+import inspect
 import json
 import logging
 import os
+import re
 import signal
 import threading
-import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+if not hasattr(inspect, "getargspec"):
+    inspect.getargspec = inspect.getfullargspec
+
 import gspread
 import pandas as pd
+import pyRofex
 from gspread_dataframe import set_with_dataframe
-from pyhomebroker import HomeBroker
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,16 +42,6 @@ INSTRUMENT_COLUMNS = [
     "volume",
     "operations",
     "datetime",
-]
-
-CAUCIONES_COLUMNS = [
-    "settlement",
-    "last",
-    "turnover",
-    "bid_amount",
-    "bid_rate",
-    "ask_rate",
-    "ask_amount",
 ]
 
 LOGGER = logging.getLogger("planilla_mkt")
@@ -105,15 +99,17 @@ def configure_logging() -> None:
 class AppConfig:
     google_credentials_path: Path
     sheet_name: str
-    hb_broker: int
-    hb_dni: str
-    hb_user: str
-    hb_password: str
+    pyrofex_user: str
+    pyrofex_password: str
+    pyrofex_account: str
+    pyrofex_api_url: str
+    pyrofex_ws_url: str
     update_interval_seconds: int
     reconnect_delay_seconds: int
     max_reconnect_delay_seconds: int
     stale_market_data_seconds: int
     healthcheck_path: Path
+    debug_print_raw: bool
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -137,10 +133,11 @@ class AppConfig:
         return cls(
             google_credentials_path=credentials_path,
             sheet_name=get_env("GOOGLE_SHEET_NAME", "Planilla_CGB"),
-            hb_broker=int(get_env("HB_BROKER", "284")),
-            hb_dni=get_env("HB_DNI", required=True),
-            hb_user=get_env("HB_USER", required=True),
-            hb_password=get_env("HB_PASSWORD", required=True),
+            pyrofex_user=get_env("PYROFEX_USER", required=True),
+            pyrofex_password=get_env("PYROFEX_PASSWORD", required=True),
+            pyrofex_account=get_env("PYROFEX_ACCOUNT", ""),
+            pyrofex_api_url=get_env("PYROFEX_API_URL", required=True),
+            pyrofex_ws_url=get_env("PYROFEX_WS_URL", required=True),
             update_interval_seconds=int(get_env("UPDATE_INTERVAL_SECONDS", "10")),
             reconnect_delay_seconds=int(get_env("RECONNECT_DELAY_SECONDS", "15")),
             max_reconnect_delay_seconds=int(get_env("MAX_RECONNECT_DELAY_SECONDS", "300")),
@@ -148,6 +145,7 @@ class AppConfig:
             healthcheck_path=Path(
                 get_env("HEALTHCHECK_PATH", str(DEFAULT_HEALTHCHECK_PATH))
             ).expanduser(),
+            debug_print_raw=get_env("DEBUG_PRINT_RAW", "false").lower() == "true",
         )
 
 
@@ -173,16 +171,44 @@ def build_instrument_frame(symbols) -> pd.DataFrame:
     return frame
 
 
-def build_cauciones_frame() -> pd.DataFrame:
-    fechas = [date.today() + timedelta(days=offset) for offset in range(1, 31)]
-    frame = pd.DataFrame({"settlement": fechas}, columns=CAUCIONES_COLUMNS)
-    frame["settlement"] = pd.to_datetime(frame["settlement"], errors="coerce")
-    return frame.set_index("settlement")
-
-
 def column_values_without_header(worksheet, col_index: int, header: str) -> list[str]:
     values = worksheet.col_values(col_index)
     return [value for value in values if value and value != header]
+
+
+def price_of(entry):
+    if entry is None:
+        return None
+    if isinstance(entry, dict):
+        return entry.get("price")
+    if isinstance(entry, list) and len(entry) > 0:
+        return entry[0].get("price")
+    return None
+
+
+def size_of(entry):
+    if entry is None:
+        return None
+    if isinstance(entry, dict):
+        return entry.get("size")
+    if isinstance(entry, list) and len(entry) > 0:
+        return entry[0].get("size")
+    return None
+
+
+def sheet_symbol_to_rofex_ticker(sheet_symbol: str) -> str:
+    normalized = re.sub(r"\s+", " ", sheet_symbol.strip())
+    match = re.match(r"^(.*?)\s*-\s*(spot|ci|24\s*hs|48\s*hs)$", normalized, re.IGNORECASE)
+
+    if match:
+        ticker = match.group(1).strip()
+        plazo_raw = re.sub(r"\s+", "", match.group(2).lower())
+        plazo_rofex = "CI" if plazo_raw in ("spot", "ci") else plazo_raw
+    else:
+        ticker = normalized
+        plazo_rofex = "24hs"
+
+    return f"MERV - XMEV - {ticker} - {plazo_rofex}"
 
 
 class PlanillaMarketApp:
@@ -196,10 +222,11 @@ class PlanillaMarketApp:
         self.sheet = None
         self.tickers_ws = None
         self.market_ws = None
-        self.cauciones_ws = None
         self.everything = pd.DataFrame()
-        self.cauciones = pd.DataFrame()
-        self.hb = None
+        self.rofex_to_sheet_symbol = {}
+        self.instrumentos_rofex = []
+        self.valid_symbols = set()
+        self.debug_message_count = 0
 
     def install_signal_handlers(self) -> None:
         def _handle_signal(signum, _frame):
@@ -238,7 +265,6 @@ class PlanillaMarketApp:
         self.sheet = self.gc.open(self.config.sheet_name)
         self.tickers_ws = self.sheet.get_worksheet(1)
         self.market_ws = self.sheet.get_worksheet(2)
-        self.cauciones_ws = self.sheet.get_worksheet(3)
 
     def load_market_definitions(self) -> None:
         LOGGER.info("Cargando tickers desde Google Sheets")
@@ -256,92 +282,167 @@ class PlanillaMarketApp:
         )
         ons = build_instrument_frame(column_values_without_header(self.tickers_ws, 9, "ONs"))
 
-        self.everything = pd.concat([acciones, bonos, cedears, letras, ons])
-        self.cauciones = build_cauciones_frame()
+        everything = pd.concat([acciones, bonos, cedears, letras, ons])
+        duplicated = everything.index[everything.index.duplicated(keep="first")].tolist()
+        if duplicated:
+            LOGGER.warning(
+                "Se encontraron %s tickers duplicados; se ignoran repeticiones: %s",
+                len(duplicated),
+                ", ".join(sorted(set(duplicated))),
+            )
+        self.everything = everything[~everything.index.duplicated(keep="first")]
         self.prev_data = None
+
+    def prepare_instruments(self) -> None:
+        self.rofex_to_sheet_symbol = {}
+        candidate_tickers = []
+
+        for sheet_symbol in self.everything.index:
+            rofex_ticker = sheet_symbol_to_rofex_ticker(sheet_symbol)
+            self.rofex_to_sheet_symbol[rofex_ticker] = sheet_symbol
+            candidate_tickers.append(rofex_ticker)
+
+        LOGGER.info("%s tickers traducidos a formato pyRofex", len(candidate_tickers))
+        if self.config.debug_print_raw:
+            for sheet_symbol in list(self.everything.index)[:5]:
+                LOGGER.info(
+                    "Ticker traducido: %s -> %s",
+                    sheet_symbol,
+                    sheet_symbol_to_rofex_ticker(sheet_symbol),
+                )
+
+        instrument_data = pyRofex.get_all_instruments(environment=pyRofex.Environment.LIVE)
+        valid_symbols = set()
+        for item in instrument_data.get("instruments", []):
+            inst_id = item.get("instrumentId", {})
+            symbol = inst_id.get("symbol")
+            if symbol:
+                valid_symbols.add(symbol)
+
+        self.valid_symbols = valid_symbols
+        self.instrumentos_rofex = [
+            ticker for ticker in candidate_tickers if ticker in self.valid_symbols
+        ]
+        invalid_tickers = [
+            ticker for ticker in candidate_tickers if ticker not in self.valid_symbols
+        ]
+
+        LOGGER.info("%s instrumentos validos detectados en pyRofex", len(self.valid_symbols))
+        LOGGER.info("%s tickers validos se van a suscribir", len(self.instrumentos_rofex))
+        if invalid_tickers:
+            LOGGER.warning(
+                "%s tickers no existen en pyRofex y se excluyen: %s",
+                len(invalid_tickers),
+                ", ".join(
+                    f"{ticker} (planilla: {self.rofex_to_sheet_symbol[ticker]})"
+                    for ticker in invalid_tickers
+                ),
+            )
 
     def update_market_timestamp(self) -> None:
         self.runtime_state.last_market_update_at = utc_now_iso()
 
-    def on_securities(self, _online, quotes):
-        with self.lock:
-            current = quotes.reset_index()
-            current["symbol"] = current["symbol"] + " - " + current["settlement"]
-            current = current.drop(["settlement"], axis=1)
-            current = current.set_index("symbol")
-            current["change"] = current["change"] / 100
-            current["datetime"] = pd.to_datetime(current["datetime"], errors="coerce")
-            self.everything.update(current)
-            self.update_market_timestamp()
-
-    def on_repos(self, _online, quotes):
-        with self.lock:
-            current = quotes.reset_index()
-            current = current.set_index("symbol")
-            current = current[["PESOS" in value for value in quotes.index]]
-            current = current.reset_index()
-            current["settlement"] = pd.to_datetime(current["settlement"], errors="coerce")
-            current = current.set_index("settlement")
-            current["last"] = current["last"] / 100
-            current["bid_rate"] = current["bid_rate"] / 100
-            current["ask_rate"] = current["ask_rate"] / 100
-            current = current.drop(
-                ["open", "high", "low", "volume", "operations", "datetime"], axis=1
+    def market_data_handler(self, message):
+        if self.config.debug_print_raw and self.debug_message_count < 10:
+            self.debug_message_count += 1
+            LOGGER.info(
+                "Mensaje crudo pyRofex:\n%s",
+                json.dumps(message, ensure_ascii=True, indent=2, default=str),
             )
-            current = current[
-                ["last", "turnover", "bid_amount", "bid_rate", "ask_rate", "ask_amount"]
-            ]
-            self.cauciones.update(current)
-            self.update_market_timestamp()
 
-    def on_error(self, _online, error):
-        message = f"HomeBroker envio error: {error}"
-        LOGGER.error(message)
-        self.runtime_state.last_error = message
+        try:
+            instrument = message.get("instrumentId", {})
+            rofex_ticker = instrument.get("symbol")
+            sheet_symbol = self.rofex_to_sheet_symbol.get(rofex_ticker)
+
+            if sheet_symbol is None or sheet_symbol not in self.everything.index:
+                return
+
+            md = message.get("marketData", {})
+            row = {
+                "bid": price_of(md.get("BI")),
+                "bid_size": size_of(md.get("BI")),
+                "ask": price_of(md.get("OF")),
+                "ask_size": size_of(md.get("OF")),
+                "last": price_of(md.get("LA")),
+                "open": price_of(md.get("OP")),
+                "high": price_of(md.get("HI")),
+                "low": price_of(md.get("LO")),
+                "previous_close": price_of(md.get("CL")),
+                "volume": md.get("NV") if md.get("NV") is not None else md.get("EV"),
+                "datetime": pd.Timestamp.now(),
+            }
+
+            with self.lock:
+                for col, val in row.items():
+                    if val is not None:
+                        self.everything.at[sheet_symbol, col] = val
+            self.update_market_timestamp()
+        except Exception as exc:
+            LOGGER.exception("Error procesando mensaje de pyRofex: %s", exc)
+
+    def error_handler(self, message):
+        error_message = f"pyRofex devolvio error: {message}"
+        LOGGER.error(error_message)
+        self.runtime_state.last_error = error_message
         self.write_healthcheck()
 
-    def connect_homebroker(self) -> None:
-        LOGGER.info("Conectando a HomeBroker")
-        self.hb = HomeBroker(
-            self.config.hb_broker,
-            on_securities=self.on_securities,
-            on_repos=self.on_repos,
-            on_error=self.on_error,
-        )
-        self.hb.auth.login(
-            dni=self.config.hb_dni,
-            user=self.config.hb_user,
-            password=self.config.hb_password,
-            raise_exception=True,
-        )
-        self.hb.online.connect()
-        self.hb.online.subscribe_securities("bluechips", "24hs")
-        self.hb.online.subscribe_securities("bluechips", "SPOT")
-        self.hb.online.subscribe_securities("government_bonds", "24hs")
-        self.hb.online.subscribe_securities("government_bonds", "SPOT")
-        self.hb.online.subscribe_securities("cedears", "24hs")
-        self.hb.online.subscribe_securities("cedears", "SPOT")
-        self.hb.online.subscribe_securities("general_board", "24hs")
-        self.hb.online.subscribe_securities("general_board", "SPOT")
-        self.hb.online.subscribe_securities("short_term_government_bonds", "24hs")
-        self.hb.online.subscribe_securities("short_term_government_bonds", "SPOT")
-        self.hb.online.subscribe_securities("corporate_bonds", "24hs")
-        self.hb.online.subscribe_securities("corporate_bonds", "SPOT")
-        self.hb.online.subscribe_repos()
-        self.runtime_state.last_successful_connect_at = utc_now_iso()
-        LOGGER.info("Conexion a HomeBroker establecida")
+    def exception_handler(self, exc):
+        error_message = f"Excepcion en websocket pyRofex: {exc}"
+        LOGGER.error(error_message)
+        self.runtime_state.last_error = error_message
+        self.write_healthcheck()
 
-    def disconnect_homebroker(self) -> None:
-        if not self.hb:
-            return
-        LOGGER.info("Cerrando conexion con HomeBroker")
-        online = getattr(self.hb, "online", None)
-        if online and hasattr(online, "disconnect"):
-            try:
-                online.disconnect()
-            except Exception:
-                LOGGER.exception("Error al desconectar HomeBroker")
-        self.hb = None
+    def connect_pyrofex(self) -> None:
+        LOGGER.info("Conectando a pyRofex")
+        pyRofex._set_environment_parameter(
+            "url",
+            self.config.pyrofex_api_url,
+            pyRofex.Environment.LIVE,
+        )
+        pyRofex._set_environment_parameter(
+            "ws",
+            self.config.pyrofex_ws_url,
+            pyRofex.Environment.LIVE,
+        )
+        pyRofex.initialize(
+            user=self.config.pyrofex_user,
+            password=self.config.pyrofex_password,
+            account=self.config.pyrofex_account,
+            environment=pyRofex.Environment.LIVE,
+        )
+        self.prepare_instruments()
+        pyRofex.init_websocket_connection(
+            market_data_handler=self.market_data_handler,
+            error_handler=self.error_handler,
+            exception_handler=self.exception_handler,
+            environment=pyRofex.Environment.LIVE,
+        )
+        pyRofex.market_data_subscription(
+            tickers=self.instrumentos_rofex,
+            entries=[
+                pyRofex.MarketDataEntry.BIDS,
+                pyRofex.MarketDataEntry.OFFERS,
+                pyRofex.MarketDataEntry.LAST,
+                pyRofex.MarketDataEntry.OPENING_PRICE,
+                pyRofex.MarketDataEntry.CLOSING_PRICE,
+                pyRofex.MarketDataEntry.HIGH_PRICE,
+                pyRofex.MarketDataEntry.LOW_PRICE,
+                pyRofex.MarketDataEntry.NOMINAL_VOLUME,
+            ],
+            depth=1,
+            environment=pyRofex.Environment.LIVE,
+        )
+        self.runtime_state.last_successful_connect_at = utc_now_iso()
+        self.runtime_state.last_error = None
+        LOGGER.info("Conexion a pyRofex establecida")
+
+    def disconnect_pyrofex(self) -> None:
+        LOGGER.info("Cerrando conexion con pyRofex")
+        try:
+            pyRofex.close_websocket_connection(environment=pyRofex.Environment.LIVE)
+        except Exception:
+            LOGGER.exception("Error al cerrar websocket pyRofex")
 
     def refresh_google_handles(self) -> None:
         self.setup_google()
@@ -349,31 +450,16 @@ class PlanillaMarketApp:
     def update_google_sheets(self) -> None:
         with self.lock:
             current_data = self.everything.reset_index().fillna("0")
-            cauciones_data = self.cauciones.reset_index().fillna("0")
 
         if current_data.equals(self.prev_data):
             return
 
         try:
             set_with_dataframe(self.market_ws, current_data)
-            set_with_dataframe(
-                self.cauciones_ws,
-                cauciones_data,
-                row=2,
-                col=2,
-                include_column_header=False,
-            )
         except Exception:
             LOGGER.exception("Fallo la escritura a Google Sheets. Reabriendo cliente.")
             self.refresh_google_handles()
             set_with_dataframe(self.market_ws, current_data)
-            set_with_dataframe(
-                self.cauciones_ws,
-                cauciones_data,
-                row=2,
-                col=2,
-                include_column_header=False,
-            )
 
         self.prev_data = current_data
         self.runtime_state.last_sheet_update_at = utc_now_iso()
@@ -415,7 +501,7 @@ class PlanillaMarketApp:
         retry_delay = self.config.reconnect_delay_seconds
         while not self.stop_event.is_set():
             try:
-                self.connect_homebroker()
+                self.connect_pyrofex()
                 retry_delay = self.config.reconnect_delay_seconds
                 self.run_connected_loop()
             except Exception as exc:
@@ -430,7 +516,7 @@ class PlanillaMarketApp:
                     self.config.max_reconnect_delay_seconds,
                 )
             finally:
-                self.disconnect_homebroker()
+                self.disconnect_pyrofex()
 
         self.set_status("stopped")
         LOGGER.info("Proceso finalizado")
