@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 DEFAULT_BOT_TIMEOUT_SECONDS = "30"
 DEFAULT_HEALTHCHECK_PATH = "/opt/planilla_mkt/healthcheck.json"
 DEFAULT_SERVICE_NAME = "planilla-mkt.service"
+DEFAULT_WATCHDOG_TIMER_NAME = "planilla-mkt-watchdog.timer"
 DEFAULT_OPERATING_START = "10:30"
 DEFAULT_OPERATING_END = "17:00"
 TELEGRAM_API_BASE = "https://api.telegram.org"
@@ -157,10 +158,10 @@ def summarize_health(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def summarize_status(service_name: str) -> str:
+def summarize_status(service_name: str, watchdog_timer_name: str) -> str:
     code_active, active = run_systemctl("is-active", service_name)
     code_enabled, enabled = run_systemctl("is-enabled", service_name)
-    _code_watchdog, watchdog = run_systemctl("is-active", "planilla-mkt-watchdog.timer")
+    _code_watchdog, watchdog = run_systemctl("is-active", watchdog_timer_name)
     _can_control, schedule_reason = can_start_or_restart()
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     return "\n".join(
@@ -187,14 +188,26 @@ def normalize_command(text: str) -> str:
 
 
 def control_service(action: str, service_name: str, enforce_schedule: bool = True) -> str:
+    watchdog_timer_name = get_env("WATCHDOG_TIMER_NAME", DEFAULT_WATCHDOG_TIMER_NAME)
+
     if action in {"start", "restart"} and enforce_schedule:
         allowed, reason = can_start_or_restart()
         if not allowed:
             return f"{action} bloqueado\n{reason}"
 
+    if action == "stop":
+        watchdog_code, watchdog_output = run_systemctl("stop", watchdog_timer_name)
+        if watchdog_code != 0:
+            return f"{action} failed\nno se pudo detener {watchdog_timer_name}: {watchdog_output or watchdog_code}"
+
     code, output = run_systemctl(action, service_name)
+    if code == 0 and action in {"start", "restart"}:
+        watchdog_code, watchdog_output = run_systemctl("start", watchdog_timer_name)
+        if watchdog_code != 0:
+            return f"{action} partial\n{service_name} ok pero no se pudo iniciar {watchdog_timer_name}: {watchdog_output or watchdog_code}"
+
     if code == 0:
-        return f"{action} ok\n{summarize_status(service_name)}"
+        return f"{action} ok\n{summarize_status(service_name, watchdog_timer_name)}"
     return f"{action} failed\n{output or 'no output'}"
 
 
@@ -211,7 +224,14 @@ def handle_command(token: str, chat_id: int, text: str, service_name: str, healt
         return
 
     if command == "/status":
-        send_message(token, chat_id, summarize_status(service_name))
+        send_message(
+            token,
+            chat_id,
+            summarize_status(
+                service_name,
+                get_env("WATCHDOG_TIMER_NAME", DEFAULT_WATCHDOG_TIMER_NAME),
+            ),
+        )
         return
 
     if command == "/health":
