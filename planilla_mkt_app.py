@@ -370,7 +370,7 @@ class PlanillaMarketApp:
                 "low": price_of(md.get("LO")),
                 "previous_close": price_of(md.get("CL")),
                 "volume": md.get("NV") if md.get("NV") is not None else md.get("EV"),
-                "datetime": pd.Timestamp.now(),
+                "datetime": pd.Timestamp.now().floor("s"),
             }
 
             with self.lock:
