@@ -211,6 +211,13 @@ def sheet_symbol_to_rofex_ticker(sheet_symbol: str) -> str:
     return f"MERV - XMEV - {ticker} - {plazo_rofex}"
 
 
+def sheet_symbol_to_rofex_future_ticker(sheet_symbol: str) -> str:
+    """Los futuros (columna 'Futuros') ya vienen en formato pyRofex nativo,
+    ej. 'DLR/AGO26', 'DLR/ENE27'. No llevan prefijo MERV - XMEV ni sufijo
+    de plazo, asi que solo se normalizan espacios/mayusculas."""
+    return re.sub(r"\s+", " ", sheet_symbol.strip()).upper()
+
+
 class PlanillaMarketApp:
     def __init__(self, config: AppConfig):
         self.config = config
@@ -226,6 +233,7 @@ class PlanillaMarketApp:
         self.rofex_to_sheet_symbol = {}
         self.instrumentos_rofex = []
         self.valid_symbols = set()
+        self.futuros_symbols = set()
         self.debug_message_count = 0
 
     def install_signal_handlers(self) -> None:
@@ -281,8 +289,11 @@ class PlanillaMarketApp:
             column_values_without_header(self.tickers_ws, 7, "Letras")
         )
         ons = build_instrument_frame(column_values_without_header(self.tickers_ws, 9, "ONs"))
+        futuros = build_instrument_frame(
+            column_values_without_header(self.tickers_ws, 13, "Futuros")
+        )
 
-        everything = pd.concat([acciones, bonos, cedears, letras, ons])
+        everything = pd.concat([acciones, bonos, cedears, letras, ons, futuros])
         duplicated = everything.index[everything.index.duplicated(keep="first")].tolist()
         if duplicated:
             LOGGER.warning(
@@ -291,6 +302,7 @@ class PlanillaMarketApp:
                 ", ".join(sorted(set(duplicated))),
             )
         self.everything = everything[~everything.index.duplicated(keep="first")]
+        self.futuros_symbols = set(futuros.index)
         self.prev_data = None
 
     def prepare_instruments(self) -> None:
@@ -298,17 +310,24 @@ class PlanillaMarketApp:
         candidate_tickers = []
 
         for sheet_symbol in self.everything.index:
-            rofex_ticker = sheet_symbol_to_rofex_ticker(sheet_symbol)
+            if sheet_symbol in self.futuros_symbols:
+                rofex_ticker = sheet_symbol_to_rofex_future_ticker(sheet_symbol)
+            else:
+                rofex_ticker = sheet_symbol_to_rofex_ticker(sheet_symbol)
             self.rofex_to_sheet_symbol[rofex_ticker] = sheet_symbol
             candidate_tickers.append(rofex_ticker)
 
         LOGGER.info("%s tickers traducidos a formato pyRofex", len(candidate_tickers))
         if self.config.debug_print_raw:
             for sheet_symbol in list(self.everything.index)[:5]:
+                if sheet_symbol in self.futuros_symbols:
+                    rofex_ticker = sheet_symbol_to_rofex_future_ticker(sheet_symbol)
+                else:
+                    rofex_ticker = sheet_symbol_to_rofex_ticker(sheet_symbol)
                 LOGGER.info(
                     "Ticker traducido: %s -> %s",
                     sheet_symbol,
-                    sheet_symbol_to_rofex_ticker(sheet_symbol),
+                    rofex_ticker,
                 )
 
         instrument_data = pyRofex.get_all_instruments(environment=pyRofex.Environment.LIVE)
